@@ -632,7 +632,8 @@ class TrustEngine {
         case "NORMAL":
           if (ok) {
             this.fail = 0;
-            this.e += 0.35 * (g.e - this.e); this.n += 0.35 * (g.n - this.n);
+            const k = inp.stationary ? (r > Math.max(10, 2 * this.lastAcc) ? 0.05 : 0) : 0.35;   // standing still: hold position
+            this.e += k * (g.e - this.e); this.n += k * (g.n - this.n);
             if (g.ve != null && hyp(g.ve, g.vn) > 2) this.th = wrapPi(this.th + 0.2 * wrapPi(Math.atan2(g.ve, g.vn) - this.th));
           } else { this.fail++; if (this.fail >= 2) { this.badState = "ALERT"; this.setState(t, "ALERT", "Spoofing suspected — " + why()); } }
           break;
@@ -646,7 +647,7 @@ class TrustEngine {
           break;
         case "RECOVERING":
           if (ok) {
-            this.okCount++; this.e += 0.25 * (g.e - this.e); this.n += 0.25 * (g.n - this.n);
+            this.okCount++; const k2 = inp.stationary ? 0.05 : 0.25; this.e += k2 * (g.e - this.e); this.n += k2 * (g.n - this.n);
             if (this.okCount >= 3) { this.fail = 0; this.setState(t, "NORMAL", "GNSS re-validated (3 consistent fixes) — trusted again"); }
           } else { this.okCount = 0; this.fail = 2; this.setState(t, "ALERT", "Re-validation rejected — " + why()); }
           break;
@@ -724,14 +725,18 @@ function stepOnce(dt) {
     inp = { v: o.odo, yawRate: o.gyro, gnss: S.attack.apply(raw, t) };
   } else if (S.mode === "live") {
     const sv = S.sens; const nowMs = Date.now();
-    sv.stepTimes = sv.stepTimes.filter(x => nowMs - x < 3000);
-    const v = sv.stepTimes.length * STRIDE_M / 3;
+    sv.stepTimes = sv.stepTimes.filter(x => nowMs - x < 2500);
+    const lastStep = sv.stepTimes.length ? sv.stepTimes[sv.stepTimes.length - 1] : 0;
+    const vRaw = nowMs - lastStep > 1300 ? 0 : sv.stepTimes.filter(x => nowMs - x < 2000).length * STRIDE_M / 2;
+    S.vF = (S.vF || 0) + (vRaw - (S.vF || 0)) * 0.4;
+    const v = vRaw === 0 && S.vF < 0.15 ? 0 : S.vF;
+    S.stationary = v < 0.15;
     let msg = null;
     if (sv.fixes.length) { const f = sv.fixes.pop(); sv.fixes = []; raw = f; truth = { e: f.e, n: f.n }; S.lastTruthFix = truth; msg = f; }
     else truth = S.lastTruthFix || null;
     if (S.attack.type === "jam") { S.jamAcc = (S.jamAcc || 0) + dt; msg = null; if (S.jamAcc >= 1) { S.jamAcc = 0; msg = { type: "nofix", jammed: true }; } }
     else msg = S.attack.apply(msg, t);
-    inp = { v, heading: sv.head, gnss: msg }; S.liveV = v;
+    inp = { v, heading: sv.head, gnss: msg, stationary: S.stationary }; S.liveV = v;
   } else {
     const R = S.replay; R.vt += dt * 1000; let msg = null;
     while (R.i < R.rows.length && R.rows[R.i].ts - R.t0 <= R.vt) {
@@ -863,7 +868,7 @@ function updateUI() {
     if (S.world) { setDot("dO", "ok"); $("vO").textContent = (S.world.v * 3.6).toFixed(0) + " km/h"; setDot("dH", "ok"); $("vH").textContent = (Math.round((e.th / DEG) + 360) % 360) + "°"; }
   } else {
     $("nO").textContent = "Step odometry (phone)"; $("nH").textContent = "Compass heading (phone)";
-    setDot("dO", S.sens.motion || S.mode === "replay" ? "ok" : "off"); $("vO").textContent = S.liveV != null ? (S.liveV * 3.6).toFixed(1) + " km/h" : "—";
+    setDot("dO", S.sens.motion || S.mode === "replay" ? "ok" : "off"); $("vO").textContent = S.liveV != null ? (S.stationary ? "standing still" : "walking " + (S.liveV * 3.6).toFixed(1) + " km/h") : "—";
     setDot("dH", S.sens.head != null ? "ok" : "off"); $("vH").textContent = S.sens.head != null ? (Math.round((S.sens.head / DEG) + 360) % 360) + "°" : (S.mode === "live" ? "no compass" : "—");
   }
   if (S.mode === "sim" && e) { if (e.state !== "NORMAL" && e.init) { setDot("dM", e.matched ? "ok" : "warn"); $("vM").textContent = e.matched ? "on road (" + e.matched.d.toFixed(1) + " m)" : "no road match"; } else { setDot("dM", "off"); $("vM").textContent = "standby (GNSS trusted)"; } }
@@ -1011,10 +1016,21 @@ function startLiveSensors() {
     Promise.all([DeviceMotionEvent.requestPermission().catch(() => "denied"), DeviceOrientationEvent.requestPermission().catch(() => "denied")]).then(([a, b]) => { if (a !== "granted") addLog("INFO", "Motion permission denied — no step odometry"); if (b !== "granted") addLog("INFO", "Orientation permission denied — no compass"); go(); });
   } else go();
   let last = 0;
+  // Step detector: remove gravity, look for peaks, and only count peaks that come in a walking rhythm
+  const SD = { g: null, lastT: 0, armed: true, cand: 0, streak: 0 };
   window.addEventListener("devicemotion", ev => {
     const a = ev.accelerationIncludingGravity; if (!a || a.x == null) return; S.sens.motion = true;
     const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z), now = Date.now();
-    if (mag > 11.3 && now - last > 300) { last = now; S.sens.stepTimes.push(now); }
+    const dt = SD.lastT ? Math.min(0.5, (now - SD.lastT) / 1000) : 0.02; SD.lastT = now;
+    SD.g = SD.g == null ? mag : SD.g + (mag - SD.g) * (dt / (dt + 0.8));      // slow average = gravity
+    const dyn = mag - SD.g;                                                    // what is left = body movement
+    if (dyn < 0.4) SD.armed = true;
+    if (SD.armed && dyn > 1.6 && now - last > 280) {                           // a peak
+      SD.armed = false;
+      const gap = (now - last) / 1000; last = now;
+      if (gap >= 0.28 && gap <= 1.4) { SD.streak++; if (SD.streak >= 2) { S.sens.stepTimes.push(now); if (SD.streak === 2) S.sens.stepTimes.push(now - gap * 1000); } }
+      else SD.streak = 1;                                                      // a lone bump is not a step
+    }
   });
   const onOri = ev => {
     let h = null;
@@ -1191,7 +1207,7 @@ document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => show
 function gotoTest() { showTab("demo"); setTimeout(() => $("testCard").scrollIntoView({ behavior: "smooth" }), 80); }
 const HELP = {
   sim: "A bus drives a loop through a simulated city with a tunnel, using simulated wheel-speed and gyro data with realistic errors. Works offline. Use 4× or 10× for long outages.",
-  live: "Uses this phone’s real GPS, compass and step counter (walking stands in for wheel pulses). Go outdoors, press Start, walk, then press Jam or Spoof. Attacks are simulated; the real GPS stays as the truth reference.",
+  live: "Uses this phone’s real GPS, compass and step counter (walking stands in for wheel pulses). Outdoors: press Start. Stand still — the arrow stays. Walk — it moves with you. Press Spoof — the GNSS starts to lie and TRUST catches it. Attacks are simulated; the real GPS stays as the truth reference.",
   replay: "Replays a CSV log recorded by the earlier TRUST phone client (columns timestamp_ms, real_lat, real_lng, heading_deg, steps). Works offline except the map background."
 };
 document.querySelectorAll("#modeSeg button").forEach(b => b.onclick = () => {
